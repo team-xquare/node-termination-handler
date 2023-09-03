@@ -1,0 +1,146 @@
+#!/bin/bash
+set -euo pipefail
+
+SCRIPTPATH="$( cd "$(dirname "$0")" ; pwd -P )"
+PLATFORM=$(uname | tr '[:upper:]' '[:lower:]')
+TEST_ID=$(uuidgen | cut -d'-' -f1 | tr '[:upper:]' '[:lower:]')
+CLUSTER_NAME_BASE=$(uuidgen | cut -d'-' -f1 | tr '[:upper:]' '[:lower:]')
+OVERRIDE_PATH=0
+KIND_CONFIG_FILE=$SCRIPTPATH/kind-three-node-cluster.yaml
+use_psp=false
+
+# shellcheck disable=SC2034
+K8_1_26="kindest/node:v1.26.3@sha256:94eb63275ad6305210041cdb5aca87c8562cc50fa152dbec3fef8c58479db4ff"
+# shellcheck disable=SC2034
+K8_1_25="kindest/node:v1.25.3@sha256:f1de3b0670462f43280114eccceab8bf1b9576d2afe0582f8f74529da6fd0365"
+# shellcheck disable=SC2034
+K8_1_24="kindest/node:v1.24.7@sha256:5c015142d9b60a0f6c45573f809957076514e38ec973565e2b2fe828b91597f5"
+# shellcheck disable=SC2034
+K8_1_23="kindest/node:v1.23.5@sha256:1a72748086bc24ed6163de1d1e33cc0e2eb5a1eb5ebffdb15b53c3bcd5376a6f"
+# shellcheck disable=SC2034
+K8_1_22="kindest/node:v1.22.2@sha256:f638a08c1f68fe2a99e724ace6df233a546eaf6713019a0b310130a4f91ebe7f"
+
+K8_VERSION="$K8_1_22"
+KUBECTL_VERSION=$(curl -s https://storage.googleapis.com/kubernetes-release/release/stable.txt)
+KIND_VERSION="0.17.0"
+HELM_VERSION="3.10.0"
+
+echoerr() { echo "$@" 1>&2; }
+
+USAGE=$(cat << 'EOM'
+  Usage: provision-cluster  [-b <BASE_CLUSTER_NAME>] [-i <TEST_IDENTIFIER>] [-v K8s_VERSION] [-o]
+  Executes the spot termination integration test for the Node Termination Handler.
+  Outputs the cluster context directory to stdout on successful completion
+
+  Example: provision-cluster -b my-test -i 123 -v 1.20
+
+          Optional:
+            -b          Base Name of cluster
+            -i          Test Identifier to suffix Cluster Name and tmp dir
+            -v          K8s version to use in this test
+            -k          Kind cluster config file
+            -o          Override path w/ your own kubectl and kind binaries
+EOM
+)
+
+# Process our input arguments
+while getopts "b:i:v:k:o" opt; do
+  case ${opt} in
+    b ) # BASE CLUSTER NAME
+        CLUSTER_NAME_BASE=$OPTARG
+      ;;
+    i ) # Test ID
+        TEST_ID=$OPTARG
+        echoerr "👉 Test Run: $TEST_ID 👈"
+      ;;
+    v ) # K8s version to provision
+        maj_ver=`echo $OPTARG | cut -d '.' -f 1`
+        min_ver=`echo $OPTARG | cut -d '.' -f 2`
+        if [[ $maj_ver -eq 1 && $min_ver -lt 25 ]]; then
+          use_psp=true
+        fi
+        OPTARG="K8_${maj_ver}_${min_ver}"
+        if [ ! -z ${OPTARG+x} ]; then
+            K8_VERSION=${!OPTARG}
+        else
+            echoerr "K8s version not supported"
+            exit 2
+        fi
+      ;;
+    k ) # Kind cluster config file
+        KIND_CONFIG_FILE=$OPTARG
+      ;;
+    o ) # Override path with your own kubectl and kind binaries
+	    OVERRIDE_PATH=1
+      ;;
+    \? )
+        echoerr "$USAGE" 1>&2
+        exit
+      ;;
+  esac
+done
+
+CLUSTER_NAME="$CLUSTER_NAME_BASE"-"$TEST_ID"
+TMP_DIR=$SCRIPTPATH/../../build/tmp-$CLUSTER_NAME
+
+echoerr "🐳 Using Kubernetes $K8_VERSION"
+mkdir -p $TMP_DIR
+
+deps=("docker")
+
+for dep in "${deps[@]}"; do
+    path_to_executable=$(which $dep)
+    if [ ! -x "$path_to_executable" ]; then
+        echoerr "You are required to have $dep installed on your system..."
+        echoerr "Please install $dep and try again. "
+        exit 3
+    fi
+done
+
+## Append to the end of PATH so that the user can override the executables if they want
+if [[ OVERRIDE_PATH -eq 1 ]]; then
+   export PATH=$PATH:$TMP_DIR
+else
+  if [ ! -x "$TMP_DIR/kubectl" ]; then
+      echoerr "🥑 Downloading the \"kubectl\" binary"
+      retry 5 curl -Lo $TMP_DIR/kubectl "https://storage.googleapis.com/kubernetes-release/release/$KUBECTL_VERSION/bin/$PLATFORM/amd64/kubectl"
+      chmod +x $TMP_DIR/kubectl
+      echoerr "👍 Downloaded the \"kubectl\" binary"
+  fi
+
+  if [ ! -x "$TMP_DIR/kind" ]; then
+      echoerr "🥑 Downloading the \"kind\" binary"
+      retry 5 curl -Lo $TMP_DIR/kind https://github.com/kubernetes-sigs/kind/releases/download/v$KIND_VERSION/kind-$PLATFORM-amd64
+      chmod +x $TMP_DIR/kind
+      echoerr "👍 Downloaded the \"kind\" binary"
+  fi
+
+  if [ ! -x "$TMP_DIR/helm" ]; then
+      echoerr "🥑 Downloading the \"helm\" binary"
+      retry 5 curl -L https://get.helm.sh/helm-v$HELM_VERSION-$PLATFORM-amd64.tar.gz | tar zxf - -C $TMP_DIR
+      mv $TMP_DIR/$PLATFORM-amd64/helm $TMP_DIR/.
+      chmod +x $TMP_DIR/helm
+      echoerr "👍 Downloaded the \"helm\" binary"
+  fi
+  export PATH=$TMP_DIR:$PATH
+fi
+
+# Disable spinners and color in kind output
+export TERM=dumb
+echoerr "🥑 Creating k8s cluster using \"kind\""
+if [[ "$use_psp" = false ]]; then
+  no_psp_kind_config_file="${TMP_DIR}/`basename $KIND_CONFIG_FILE`"
+  cat $KIND_CONFIG_FILE | sed 's/,PodSecurityPolicy//' > "${no_psp_kind_config_file}"
+  KIND_CONFIG_FILE="${no_psp_kind_config_file}"
+fi
+retry 3 kind create cluster --name "$CLUSTER_NAME" --image $K8_VERSION --config "$KIND_CONFIG_FILE" --kubeconfig $TMP_DIR/kubeconfig 1>&2
+
+echo "$CLUSTER_NAME" > "$TMP_DIR/clustername"
+echoerr "👍 Created k8s cluster using \"kind\""
+
+if [[ "$use_psp" = true ]]; then
+  kubectl apply -f "$SCRIPTPATH/psp-default.yaml" --context "kind-$CLUSTER_NAME" --kubeconfig "$TMP_DIR/kubeconfig" 1>&2
+  kubectl apply -f "$SCRIPTPATH/psp-privileged.yaml" --context "kind-$CLUSTER_NAME" --kubeconfig "$TMP_DIR/kubeconfig" 1>&2
+fi
+
+echo "$TMP_DIR"
