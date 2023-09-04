@@ -26,6 +26,7 @@ import (
 	"github.com/aws/aws-node-termination-handler/pkg/node"
 	h "github.com/aws/aws-node-termination-handler/pkg/test"
 	"github.com/aws/aws-node-termination-handler/pkg/uptime"
+	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes/fake"
@@ -122,7 +123,7 @@ func TestDrainSuccess(t *testing.T) {
 		context.Background(),
 		&v1.Pod{
 			ObjectMeta: metav1.ObjectMeta{
-				GenerateName: "cool-app-pod-",
+				GenerateName: "dms-prod-be",
 				OwnerReferences: []metav1.OwnerReference{
 					{
 						APIVersion: "apps/v1",
@@ -131,9 +132,27 @@ func TestDrainSuccess(t *testing.T) {
 						Controller: &isOwnerController,
 					},
 				},
+				Labels: map[string]string{
+					"app":  "dms-prod-be",
+					"type": "be",
+				},
 			},
 			Spec: v1.PodSpec{
 				NodeName: nodeName,
+			},
+		},
+		metav1.CreateOptions{})
+	h.Ok(t, err)
+
+	var replica int32 = 1
+	_, err = client.AppsV1().Deployments("default").Create(
+		context.Background(),
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: nodeName, Labels: map[string]string{"app": "dms-prod-be"},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &replica,
 			},
 		},
 		metav1.CreateOptions{})

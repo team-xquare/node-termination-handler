@@ -124,11 +124,7 @@ func (n Node) CordonAndDrain(nodeName string, reason string, recorder recorderIn
 	}
 	// Emit events for all pods that will be evicted
 
-	clusterConfig, err := rest.InClusterConfig() // Assuming you are running this code inside a pod in the cluster
-	if err != nil {
-		panic(err.Error())
-	}
-	clientSet, err := kubernetes.NewForConfig(clusterConfig)
+	clientSet := n.drainHelper.Client
 	updatedDeployments := list.New()
 
 	if recorder != nil {
@@ -136,29 +132,31 @@ func (n Node) CordonAndDrain(nodeName string, reason string, recorder recorderIn
 		if err == nil {
 			for _, pod := range pods.Items {
 				appValue := pod.Labels["app"]
-				if appValue != "" {
+				typeValue := pod.Labels["type"]
+				log.Info().Msgf("pod %s found (app: %s, type: %s)", pod.Name, appValue, typeValue)
+
+				if appValue != "" && (typeValue == "fe" || typeValue == "be") {
 
 					deployments, err := clientSet.AppsV1().Deployments(pod.Namespace).List(
 						context.TODO(), metav1.ListOptions{LabelSelector: fmt.Sprintf("app=%s", appValue)},
 					)
 
-					if deployments.Size() == 0 || err != nil {
-						panic(err.Error())
+					if err == nil && len(deployments.Items) > 0 {
+						deployment := deployments.Items[0]
+						replicaCount := deployment.Spec.Replicas
+
+						newReplicaCount := *replicaCount + 1
+						deployment.Spec.Replicas = &newReplicaCount
+
+						updatedDeployment, err := clientSet.AppsV1().Deployments(pod.Namespace).Update(
+							context.TODO(), &deployment, metav1.UpdateOptions{},
+						)
+						log.Info().Msgf("Increase deployment %s's replica %d to %d", appValue, *replicaCount, newReplicaCount)
+						if err != nil {
+							panic(err.Error())
+						}
+						updatedDeployments.PushBack(updatedDeployment)
 					}
-
-					deployment := deployments.Items[0]
-					replicaCount := deployment.Spec.Replicas
-
-					newReplicaCount := *replicaCount + 1
-					deployment.Spec.Replicas = &newReplicaCount
-
-					updatedDeployment, err := clientSet.AppsV1().Deployments(pod.Namespace).Update(
-						context.TODO(), &deployment, metav1.UpdateOptions{},
-					)
-					if err != nil {
-						panic(err.Error())
-					}
-					updatedDeployments.PushBack(updatedDeployment)
 				}
 
 				podRef := &corev1.ObjectReference{
